@@ -66,10 +66,14 @@ macd apply
 
 ---
 
+⚖️ Disclaimer
 
-## ⚖️ Disclaimer
+Random MAC addresses default to Locally Administered (LAA). Do not spoof OUIs you do not own in environments where policy or compliance applies.
 
-* Random MACs default to **locally administered** (LAA). Do **not** spoof OUIs you do not own in environments where policy/compliance applies.
-* Changing MAC may affect network access controls (e.g., MAC filtering) and could violate network policies.
+Changing your MAC address may affect network access controls (e.g., MAC filtering) and could violate network policies.
 
----
+This software is provided strictly for educational and personal use only.
+
+The user is solely responsible for any damages, disruptions, or legal consequences resulting from its use.
+
+The developer cannot be held liable under any circumstances.
