@@ -1,0 +1,122 @@
+#!/system/bin/sh
+RED="\033[1;31m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+BLUE="\033[1;34m"
+RESET="\033[0m"
+
+CONFIG="/data/adb/modules/macdroid/mac.conf"
+
+print_banner() {
+    echo -e "${BLUE}"
+    echo "╔══════════════════════════════════════════╗"
+    echo "║              MacDroid Utility            ║"
+    echo "╚══════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+ok() { echo -e "${GREEN}[OK]${RESET} $1"; }
+error() { echo -e "${RED}[ERROR]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
+info() { echo -e "${BLUE}[INFO]${RESET} $1"; }
+
+generate_random_mac() {
+    hexchars="0123456789ABCDEF"
+    echo "02$(for i in {1..5}; do echo -n ":${hexchars:$((RANDOM%16)):1}${hexchars:$((RANDOM%16)):1}"; done)"
+}
+
+set_mac() {
+    iface=$1
+    newmac=$2
+    if [ -z "$iface" ] || [ -z "$newmac" ]; then
+        error "Usage: macd set <mac> <iface>"
+        exit 1
+    fi
+    ip link set dev $iface down
+    ip link set dev $iface address $newmac
+    ip link set dev $iface up
+    echo "$newmac $iface" > "$CONFIG"
+    ok "MAC changed to $newmac on $iface"
+}
+
+apply_saved() {
+    if [ ! -f "$CONFIG" ]; then
+        warn "No saved MAC address found."
+        exit 1
+    fi
+    read savedmac iface < "$CONFIG"
+    ip link set dev $iface down
+    ip link set dev $iface address $savedmac
+    ip link set dev $iface up
+    ok "Restored MAC $savedmac on $iface"
+}
+
+show_mac() {
+    iface=$1
+    if [ -z "$iface" ]; then
+        error "Usage: macd show <iface>"
+        exit 1
+    fi
+    current=$(ip link show $iface | grep ether | awk '{print $2}')
+    info "Current MAC on $iface: $current"
+}
+
+menu() {
+    print_banner
+    echo "1) Show current MAC"
+    echo "2) Set custom MAC"
+    echo "3) Generate random MAC"
+    echo "4) Apply saved MAC"
+    echo "5) Exit"
+    echo -n "Choose option: "
+    read choice
+    case $choice in
+        1)
+            echo -n "Enter interface (e.g., wlan0): "
+            read iface
+            show_mac $iface
+            ;;
+        2)
+            echo -n "Enter interface (e.g., wlan0): "
+            read iface
+            echo -n "Enter new MAC: "
+            read mac
+            set_mac $iface $mac
+            ;;
+        3)
+            echo -n "Enter interface (e.g., wlan0): "
+            read iface
+            newmac=$(generate_random_mac)
+            set_mac $iface $newmac
+            ;;
+        4)
+            apply_saved
+            ;;
+        5)
+            exit 0
+            ;;
+        *)
+            error "Invalid option"
+            ;;
+    esac
+}
+
+if [ $# -eq 0 ]; then
+    menu
+else
+    case $1 in
+        set) set_mac $2 $3 ;;
+        show) show_mac $2 ;;
+        random) iface=$2; mac=$(generate_random_mac); set_mac $iface $mac ;;
+        apply) apply_saved ;;
+        help)
+            echo "MacDroid - Usage:"
+            echo " macd show <iface>      Show current MAC"
+            echo " macd set <mac> <iface> Set custom MAC"
+            echo " macd random <iface>    Generate random MAC"
+            echo " macd apply             Apply saved MAC"
+            echo " macd                   Interactive menu"
+            ;;
+        *) menu ;;
+    esac
+fi
