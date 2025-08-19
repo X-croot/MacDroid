@@ -66,7 +66,7 @@ macd apply
 
 ---
 
-⚖️ Disclaimer
+## ⚖️ Disclaimer
 
 Random MAC addresses default to Locally Administered (LAA). Do not spoof OUIs you do not own in environments where policy or compliance applies.
 
