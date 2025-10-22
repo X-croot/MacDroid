@@ -30,7 +30,7 @@ macd
 
 ```sh
 macd show <iface>
-macd set <mac> <iface>
+macd set <iface> <mac> 
 macd random <iface>
 macd apply
 macd help
@@ -48,7 +48,7 @@ macd help
 macd show wlan0
 
 # Set a specific MAC on wlan0 and save it for reboot
-macd set 12:34:56:78:9A:BC wlan0
+macd set wlan0 12:34:56:78:9A:BC
 
 # Generate and apply a random MAC on wlan0 (also saves it)
 macd random wlan0
