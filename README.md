@@ -6,6 +6,7 @@ A minimal, fast, and colorful CLI to manage and persist custom MAC addresses on 
 
 ## Installation (Magisk)
 
+0. If using Android 12 thru 14, download and configure [Libresposed](https://github.com/matu6968/libresposed) to block MAC-address randomization.
 1. Download `MacDroid.zip` to your device.
 2. Open **Magisk** → **Modules** → **Install from storage** → select `MacDroid.zip`.
 3. Reboot.
