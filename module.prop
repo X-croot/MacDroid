@@ -1,0 +1,8 @@
+id=macdroid
+name=MacDroid
+version=v2.0
+versionCode=200
+author=MacDroid
+description=Advanced MAC address controller for Android. Persistent spoofing, multi-interface support, OUI vendor lookup, MAC history, boot-time apply. Works on Android 6.0 - 16.
+updateJson=
+minMagisk=20400

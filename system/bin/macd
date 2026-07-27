@@ -1,0 +1,646 @@
+#!/system/bin/sh
+# ============================================================
+#   MacDroid  -  Advanced MAC Address Suite for Android
+#   Persistent, multi-interface, boot-safe MAC controller.
+# ============================================================
+
+VERSION="2.0"
+STATE_DIR="/data/adb/macdroid"
+CONF_FILE="$STATE_DIR/mac.conf"
+BACKUP_FILE="$STATE_DIR/original.mac"
+HISTORY_FILE="$STATE_DIR/history.log"
+OUI_DB=""
+for _p in \
+    /system/etc/macdroid/oui.db \
+    /data/adb/modules/macdroid/system/etc/macdroid/oui.db \
+    /vendor/etc/macdroid/oui.db; do
+    [ -f "$_p" ] && OUI_DB="$_p" && break
+done
+unset _p
+MAX_HISTORY=50
+
+# -------- terminal capabilities --------
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+    C_RESET=$(printf '\033[0m')
+    C_BOLD=$(printf '\033[1m')
+    C_DIM=$(printf '\033[2m')
+    C_RED=$(printf '\033[38;5;203m')
+    C_GRN=$(printf '\033[38;5;120m')
+    C_YEL=$(printf '\033[38;5;222m')
+    C_BLU=$(printf '\033[38;5;111m')
+    C_CYN=$(printf '\033[38;5;123m')
+    C_MAG=$(printf '\033[38;5;213m')
+    C_GRY=$(printf '\033[38;5;244m')
+    C_BG=$(printf '\033[48;5;236m')
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GRN=""
+    C_YEL=""; C_BLU=""; C_CYN=""; C_MAG=""; C_GRY=""; C_BG=""
+fi
+
+# -------- state dir --------
+[ ! -d "$STATE_DIR" ] && mkdir -p "$STATE_DIR" 2>/dev/null
+[ ! -f "$HISTORY_FILE" ] && touch "$HISTORY_FILE" 2>/dev/null
+
+# -------- output helpers --------
+_msg() {
+    tag="$1"; color="$2"; shift 2
+    printf '%s %s%s%s %s\n' "$color" "$C_BOLD" "$tag" "$C_RESET" "$*"
+}
+ok()    { _msg "  ok  " "$C_GRN" "$@"; }
+err()   { _msg " fail " "$C_RED" "$@"; }
+warn()  { _msg " warn " "$C_YEL" "$@"; }
+info()  { _msg " info " "$C_BLU" "$@"; }
+step()  { _msg " step " "$C_CYN" "$@"; }
+
+hr() {
+    w=${1:-58}
+    i=0
+    printf '%s' "$C_GRY"
+    while [ $i -lt $w ]; do printf '-'; i=$((i+1)); done
+    printf '%s\n' "$C_RESET"
+}
+
+# -------- banner --------
+banner() {
+    printf '\n'
+    printf '%s%s' "$C_BOLD" "$C_MAG"
+    printf '   MMM   MMM       DDDD    RRR    OOO   III  DDDD  \n'
+    printf '   MMMM MMMM       D   D   R  R  O   O   I   D   D \n'
+    printf '   M MMM  M   ==   D   D   RRR   O   O   I   D   D \n'
+    printf '   M  M   M   ==   D   D   R R   O   O   I   D   D \n'
+    printf '   M      M        DDDD    R  R   OOO   III  DDDD  \n'
+    printf '%s' "$C_RESET"
+    printf '\n'
+    printf '  %sMacDroid  -  Advanced MAC Address Suite%s   %sv%s%s\n' "$C_CYN" "$C_RESET" "$C_GRY" "$VERSION" "$C_RESET"
+    hr 58
+    printf '\n'
+}
+
+# -------- root check --------
+require_root() {
+    if [ "$(id -u)" != "0" ]; then
+        err "Root access is required."
+        info "Run:  ${C_BOLD}su -c macd${C_RESET}"
+        exit 2
+    fi
+}
+
+# -------- validators --------
+is_valid_mac() {
+    m="$1"
+    # 6 hex pairs separated by ':'
+    echo "$m" | grep -Eq '^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$'
+}
+
+normalize_mac() {
+    echo "$1" | tr 'a-z' 'A-Z'
+}
+
+iface_exists() {
+    [ -n "$1" ] && [ -e "/sys/class/net/$1" ]
+}
+
+# -------- MAC helpers --------
+current_mac() {
+    iface="$1"
+    if [ -r "/sys/class/net/$iface/address" ]; then
+        cat "/sys/class/net/$iface/address" | tr 'a-z' 'A-Z'
+    else
+        ip link show "$iface" 2>/dev/null | awk '/ether/ {print toupper($2)}'
+    fi
+}
+
+iface_state() {
+    iface="$1"
+    st=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)
+    [ -z "$st" ] && st="unknown"
+    echo "$st"
+}
+
+iface_type() {
+    iface="$1"
+    case "$iface" in
+        wlan*|wifi*) echo "wireless" ;;
+        eth*)        echo "ethernet" ;;
+        rmnet*|ccmni*|rndis*) echo "mobile" ;;
+        bt-*|bnep*)  echo "bluetooth" ;;
+        lo)          echo "loopback" ;;
+        p2p*)        echo "wifi-direct" ;;
+        ap*)         echo "hotspot" ;;
+        tun*|tap*|vpn*) echo "vpn/tunnel" ;;
+        *)           echo "other" ;;
+    esac
+}
+
+# -------- random MAC (POSIX safe) --------
+rand_hex() {
+    # produce two hex chars using /dev/urandom (fallback: $RANDOM)
+    if [ -r /dev/urandom ]; then
+        od -An -N1 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | tr 'a-f' 'A-F'
+    else
+        printf '%02X' $(( ${RANDOM:-$$} % 256 ))
+    fi
+}
+
+generate_random_mac() {
+    mode="${1:-laa}"
+    case "$mode" in
+        oui)
+            # keep first 3 bytes of provided reference, randomize last 3
+            ref="$2"
+            p1=$(echo "$ref" | cut -d: -f1)
+            p2=$(echo "$ref" | cut -d: -f2)
+            p3=$(echo "$ref" | cut -d: -f3)
+            b4=$(rand_hex); b5=$(rand_hex); b6=$(rand_hex)
+            printf '%s:%s:%s:%s:%s:%s' "$p1" "$p2" "$p3" "$b4" "$b5" "$b6"
+            ;;
+        full)
+            b1=$(rand_hex); b2=$(rand_hex); b3=$(rand_hex)
+            b4=$(rand_hex); b5=$(rand_hex); b6=$(rand_hex)
+            printf '%s:%s:%s:%s:%s:%s' "$b1" "$b2" "$b3" "$b4" "$b5" "$b6"
+            ;;
+        *)
+            # LAA (locally administered): 2nd nibble of first byte in 2,6,A,E
+            first_nibble=$(rand_hex | cut -c1)
+            pick=$(rand_hex | cut -c2)
+            case "$pick" in
+                0|4|8|C) second_nibble=2 ;;
+                1|5|9|D) second_nibble=6 ;;
+                2|6|A|E) second_nibble=A ;;
+                *)       second_nibble=E ;;
+            esac
+            b1="${first_nibble}${second_nibble}"
+            b2=$(rand_hex); b3=$(rand_hex)
+            b4=$(rand_hex); b5=$(rand_hex); b6=$(rand_hex)
+            printf '%s:%s:%s:%s:%s:%s' "$b1" "$b2" "$b3" "$b4" "$b5" "$b6"
+            ;;
+    esac
+}
+
+# -------- OUI vendor lookup --------
+lookup_vendor() {
+    mac=$(normalize_mac "$1")
+    prefix=$(echo "$mac" | cut -c1-8)
+    if [ -f "$OUI_DB" ]; then
+        vendor=$(grep -i "^$prefix" "$OUI_DB" 2>/dev/null | head -n1 | cut -d'|' -f2-)
+        if [ -n "$vendor" ]; then
+            echo "$vendor"
+            return 0
+        fi
+    fi
+    # LAA detection
+    second_nibble=$(echo "$prefix" | cut -c2)
+    case "$second_nibble" in
+        2|6|A|E|a|e) echo "Locally Administered (random)"; return 0 ;;
+    esac
+    echo "Unknown vendor"
+}
+
+# -------- config I/O --------
+save_config() {
+    iface="$1"; mac="$2"
+    tmp="$STATE_DIR/.mac.conf.tmp"
+    : > "$tmp"
+    if [ -f "$CONF_FILE" ]; then
+        # rewrite, replacing any existing entry for this iface
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in ''|\#*) echo "$line" >> "$tmp"; continue ;; esac
+            existing_if=$(echo "$line" | awk '{print $1}')
+            [ "$existing_if" = "$iface" ] || echo "$line" >> "$tmp"
+        done < "$CONF_FILE"
+    fi
+    echo "$iface $mac" >> "$tmp"
+    mv "$tmp" "$CONF_FILE"
+    chmod 0644 "$CONF_FILE"
+}
+
+remove_config() {
+    iface="$1"
+    [ ! -f "$CONF_FILE" ] && return 0
+    tmp="$STATE_DIR/.mac.conf.tmp"
+    : > "$tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|\#*) echo "$line" >> "$tmp"; continue ;; esac
+        existing_if=$(echo "$line" | awk '{print $1}')
+        [ "$existing_if" = "$iface" ] || echo "$line" >> "$tmp"
+    done < "$CONF_FILE"
+    mv "$tmp" "$CONF_FILE"
+}
+
+get_saved_mac() {
+    iface="$1"
+    [ ! -f "$CONF_FILE" ] && return 1
+    grep -E "^$iface[[:space:]]" "$CONF_FILE" 2>/dev/null | head -n1 | awk '{print $2}'
+}
+
+backup_original() {
+    iface="$1"; mac="$2"
+    [ -z "$mac" ] && return 0
+    if [ -f "$BACKUP_FILE" ] && grep -q "^$iface " "$BACKUP_FILE"; then
+        return 0
+    fi
+    echo "$iface $mac" >> "$BACKUP_FILE"
+    chmod 0644 "$BACKUP_FILE"
+}
+
+get_original_mac() {
+    iface="$1"
+    [ ! -f "$BACKUP_FILE" ] && return 1
+    grep "^$iface " "$BACKUP_FILE" 2>/dev/null | head -n1 | awk '{print $2}'
+}
+
+log_history() {
+    ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+    [ -z "$ts" ] && ts=$(date)
+    printf '%s  %s  %s\n' "$ts" "$1" "$2" >> "$HISTORY_FILE"
+    # trim
+    if [ -f "$HISTORY_FILE" ]; then
+        lines=$(wc -l < "$HISTORY_FILE" 2>/dev/null | tr -d ' ')
+        if [ -n "$lines" ] && [ "$lines" -gt "$MAX_HISTORY" ]; then
+            tail -n "$MAX_HISTORY" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+        fi
+    fi
+}
+
+# -------- apply MAC to interface --------
+apply_mac() {
+    iface="$1"; mac="$2"; persist="${3:-yes}"
+
+    if ! iface_exists "$iface"; then
+        err "Interface not found: ${C_BOLD}$iface${C_RESET}"
+        return 1
+    fi
+    if ! is_valid_mac "$mac"; then
+        err "Invalid MAC format: ${C_BOLD}$mac${C_RESET}"
+        info "Expected: ${C_DIM}XX:XX:XX:XX:XX:XX${C_RESET}"
+        return 1
+    fi
+    mac=$(normalize_mac "$mac")
+
+    old=$(current_mac "$iface")
+    backup_original "$iface" "$old"
+
+    step "Bringing ${C_BOLD}$iface${C_RESET} down ..."
+    ip link set dev "$iface" down 2>/dev/null
+
+    step "Assigning ${C_BOLD}$mac${C_RESET} ..."
+    ip link set dev "$iface" address "$mac" 2>/dev/null
+    rc=$?
+
+    step "Bringing ${C_BOLD}$iface${C_RESET} up ..."
+    ip link set dev "$iface" up 2>/dev/null
+
+    sleep 1
+    new=$(current_mac "$iface")
+
+    if [ "$new" = "$mac" ]; then
+        ok "MAC updated: ${C_GRY}$old${C_RESET} -> ${C_BOLD}${C_GRN}$mac${C_RESET}"
+        log_history "$iface" "$mac"
+        if [ "$persist" = "yes" ]; then
+            save_config "$iface" "$mac"
+            info "Saved for boot-time re-apply."
+        fi
+        vendor=$(lookup_vendor "$mac")
+        info "Vendor: ${C_DIM}$vendor${C_RESET}"
+        return 0
+    else
+        err "Kernel refused the change (returned $rc)."
+        warn "Current MAC on $iface is still: $new"
+        info "Possible causes: driver lock, VIF re-creation on Wi-Fi (try turning Wi-Fi OFF first), or SELinux."
+        return 1
+    fi
+}
+
+# -------- commands --------
+cmd_show() {
+    iface="$1"
+    if [ -z "$iface" ]; then
+        cmd_status
+        return
+    fi
+    if ! iface_exists "$iface"; then
+        err "Interface not found: $iface"
+        return 1
+    fi
+    mac=$(current_mac "$iface")
+    saved=$(get_saved_mac "$iface")
+    original=$(get_original_mac "$iface")
+    vendor=$(lookup_vendor "$mac")
+
+    printf '\n'
+    printf '  %s%s%s\n' "$C_BOLD" "$iface" "$C_RESET"
+    hr 46
+    printf '  %-14s %s%s%s\n' "Current"  "$C_GRN" "$mac" "$C_RESET"
+    printf '  %-14s %s\n'    "Vendor"   "$vendor"
+    printf '  %-14s %s\n'    "Type"     "$(iface_type "$iface")"
+    printf '  %-14s %s\n'    "State"    "$(iface_state "$iface")"
+    [ -n "$original" ] && printf '  %-14s %s\n' "Original"  "$original"
+    [ -n "$saved" ]    && printf '  %-14s %s\n' "Persisted" "$saved"
+    printf '\n'
+}
+
+cmd_status() {
+    banner
+    printf '  %sInterfaces%s\n' "$C_BOLD" "$C_RESET"
+    hr 58
+    printf '  %-12s %-18s %-10s %s\n' "IFACE" "MAC" "STATE" "TYPE"
+    hr 58
+    for path in /sys/class/net/*; do
+        [ -e "$path" ] || continue
+        iface=$(basename "$path")
+        [ "$iface" = "lo" ] && continue
+        mac=$(current_mac "$iface")
+        state=$(iface_state "$iface")
+        typ=$(iface_type "$iface")
+        color="$C_GRY"
+        [ "$state" = "up" ] && color="$C_GRN"
+        [ "$state" = "down" ] && color="$C_RED"
+        printf '  %-12s %-18s %s%-10s%s %s\n' "$iface" "$mac" "$color" "$state" "$C_RESET" "$typ"
+    done
+    printf '\n'
+    if [ -f "$CONF_FILE" ] && [ -s "$CONF_FILE" ]; then
+        printf '  %sPersisted rules%s\n' "$C_BOLD" "$C_RESET"
+        hr 58
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in ''|\#*) continue ;; esac
+            piface=$(echo "$line" | awk '{print $1}')
+            pmac=$(echo "$line" | awk '{print $2}')
+            printf '  %-12s -> %s\n' "$piface" "$pmac"
+        done < "$CONF_FILE"
+        printf '\n'
+    fi
+}
+
+cmd_set() {
+    iface="$1"; mac="$2"
+    if [ -z "$iface" ] || [ -z "$mac" ]; then
+        err "Usage: macd set <iface> <mac>"
+        return 1
+    fi
+    require_root
+    apply_mac "$iface" "$mac" yes
+}
+
+cmd_random() {
+    iface="$1"; mode="${2:-laa}"
+    if [ -z "$iface" ]; then
+        err "Usage: macd random <iface> [laa|full|oui]"
+        return 1
+    fi
+    require_root
+    ref=""
+    [ "$mode" = "oui" ] && ref=$(current_mac "$iface")
+    newmac=$(generate_random_mac "$mode" "$ref")
+    info "Generated ${C_BOLD}$newmac${C_RESET} (mode: $mode)"
+    apply_mac "$iface" "$newmac" yes
+}
+
+cmd_apply() {
+    require_root
+    if [ ! -f "$CONF_FILE" ] || [ ! -s "$CONF_FILE" ]; then
+        warn "No persisted rules yet."
+        return 1
+    fi
+    fail=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|\#*) continue ;; esac
+        piface=$(echo "$line" | awk '{print $1}')
+        pmac=$(echo "$line" | awk '{print $2}')
+        [ -z "$piface" ] || [ -z "$pmac" ] && continue
+        step "Re-applying $pmac to $piface"
+        apply_mac "$piface" "$pmac" no || fail=$((fail+1))
+    done < "$CONF_FILE"
+    [ $fail -eq 0 ] && ok "All persisted rules re-applied." \
+                    || warn "$fail rule(s) failed."
+}
+
+cmd_restore() {
+    iface="$1"
+    if [ -z "$iface" ]; then
+        err "Usage: macd restore <iface>"
+        return 1
+    fi
+    require_root
+    orig=$(get_original_mac "$iface")
+    if [ -z "$orig" ]; then
+        err "No original MAC backup for $iface."
+        return 1
+    fi
+    info "Restoring original: ${C_BOLD}$orig${C_RESET}"
+    if apply_mac "$iface" "$orig" no; then
+        remove_config "$iface"
+        ok "Persisted rule for $iface removed."
+    fi
+}
+
+cmd_unset() {
+    iface="$1"
+    if [ -z "$iface" ]; then
+        err "Usage: macd unset <iface>"
+        return 1
+    fi
+    require_root
+    remove_config "$iface"
+    ok "Persistence removed for $iface (current MAC untouched)."
+}
+
+cmd_history() {
+    if [ ! -f "$HISTORY_FILE" ] || [ ! -s "$HISTORY_FILE" ]; then
+        info "No history yet."
+        return 0
+    fi
+    printf '\n  %sChange history (most recent last)%s\n' "$C_BOLD" "$C_RESET"
+    hr 58
+    while IFS= read -r line; do
+        printf '  %s\n' "$line"
+    done < "$HISTORY_FILE"
+    printf '\n'
+}
+
+cmd_vendor() {
+    mac="$1"
+    if [ -z "$mac" ]; then
+        err "Usage: macd vendor <mac>"
+        return 1
+    fi
+    if ! is_valid_mac "$mac"; then
+        err "Invalid MAC format."
+        return 1
+    fi
+    v=$(lookup_vendor "$mac")
+    info "$mac -> $v"
+}
+
+cmd_help() {
+    banner
+    cat <<EOF
+  ${C_BOLD}USAGE${C_RESET}
+    macd                          Interactive menu
+    macd <command> [args]
+
+  ${C_BOLD}COMMANDS${C_RESET}
+    ${C_CYN}status${C_RESET}                        List all interfaces + persisted rules
+    ${C_CYN}show${C_RESET}    <iface>               Show MAC + info for one interface
+    ${C_CYN}set${C_RESET}     <iface> <mac>         Set custom MAC (persistent)
+    ${C_CYN}random${C_RESET}  <iface> [mode]        Random MAC. Modes: laa | full | oui
+    ${C_CYN}apply${C_RESET}                         Re-apply all persisted rules now
+    ${C_CYN}restore${C_RESET} <iface>               Restore original MAC + clear rule
+    ${C_CYN}unset${C_RESET}   <iface>               Remove persistence (keep current MAC)
+    ${C_CYN}vendor${C_RESET}  <mac>                 Lookup OUI vendor
+    ${C_CYN}history${C_RESET}                       Show last ${MAX_HISTORY} changes
+    ${C_CYN}version${C_RESET}                       Print version
+    ${C_CYN}help${C_RESET}                          This screen
+
+  ${C_BOLD}EXAMPLES${C_RESET}
+    macd status
+    macd show wlan0
+    macd set wlan0 12:34:56:78:9A:BC
+    macd random wlan0 laa
+    macd random wlan0 oui        ${C_DIM}# keep vendor, randomize NIC${C_RESET}
+    macd restore wlan0
+
+  ${C_BOLD}NOTES${C_RESET}
+    - Wi-Fi drivers may refuse MAC changes while radio is ON.
+      If a change fails, disable Wi-Fi first, then retry.
+    - Persisted rules are re-applied automatically at boot.
+
+EOF
+}
+
+cmd_version() {
+    printf 'MacDroid v%s\n' "$VERSION"
+}
+
+# -------- interactive menu --------
+prompt() {
+    printf '  %s%s%s ' "$C_MAG" "$1" "$C_RESET"
+    read -r REPLY
+}
+
+pick_iface() {
+    ifaces=""
+    for path in /sys/class/net/*; do
+        [ -e "$path" ] || continue
+        name=$(basename "$path")
+        [ "$name" = "lo" ] && continue
+        ifaces="$ifaces $name"
+    done
+    ifaces=$(echo "$ifaces" | sed 's/^ //')
+
+    if [ -z "$ifaces" ]; then
+        err "No network interfaces detected."
+        return 1
+    fi
+
+    printf '\n  %sAvailable interfaces%s\n' "$C_BOLD" "$C_RESET"
+    hr 46
+    n=1
+    for i in $ifaces; do
+        mac=$(current_mac "$i")
+        st=$(iface_state "$i")
+        printf '  %s%d%s) %-10s %s  %s(%s)%s\n' "$C_YEL" "$n" "$C_RESET" "$i" "$mac" "$C_GRY" "$st" "$C_RESET"
+        n=$((n+1))
+    done
+    printf '\n'
+    prompt "Select interface number (or type a name):"
+    SEL_INPUT="$REPLY"
+
+    case "$SEL_INPUT" in
+        ''|*[!0-9]*)
+            SEL_IFACE="$SEL_INPUT"
+            ;;
+        *)
+            k=1
+            SEL_IFACE=""
+            for i in $ifaces; do
+                if [ "$k" = "$SEL_INPUT" ]; then
+                    SEL_IFACE="$i"; break
+                fi
+                k=$((k+1))
+            done
+            ;;
+    esac
+
+    if ! iface_exists "$SEL_IFACE"; then
+        err "Invalid selection."
+        return 1
+    fi
+    return 0
+}
+
+menu_item() {
+    printf '  %s%s%s  %s%s%s\n' "$C_YEL" "$1" "$C_RESET" "$C_BOLD" "$2" "$C_RESET"
+}
+
+menu() {
+    while true; do
+        clear 2>/dev/null
+        banner
+        printf '  %sMain menu%s\n' "$C_BOLD" "$C_RESET"
+        hr 46
+        menu_item "1)" "Status  (all interfaces)"
+        menu_item "2)" "Show details for one interface"
+        menu_item "3)" "Set custom MAC"
+        menu_item "4)" "Random MAC  (LAA)"
+        menu_item "5)" "Random MAC  (keep vendor OUI)"
+        menu_item "6)" "Re-apply persisted rules"
+        menu_item "7)" "Restore original MAC"
+        menu_item "8)" "Remove persistence"
+        menu_item "9)" "OUI vendor lookup"
+        menu_item "h)" "History"
+        menu_item "?)" "Help"
+        menu_item "q)" "Quit"
+        printf '\n'
+        prompt "Your choice:"
+        choice="$REPLY"
+        printf '\n'
+
+        case "$choice" in
+            1) cmd_status ;;
+            2) pick_iface && cmd_show "$SEL_IFACE" ;;
+            3)
+                pick_iface || { prompt "Press Enter"; continue; }
+                prompt "New MAC (XX:XX:XX:XX:XX:XX):"
+                cmd_set "$SEL_IFACE" "$REPLY"
+                ;;
+            4) pick_iface && cmd_random "$SEL_IFACE" laa ;;
+            5) pick_iface && cmd_random "$SEL_IFACE" oui ;;
+            6) cmd_apply ;;
+            7) pick_iface && cmd_restore "$SEL_IFACE" ;;
+            8) pick_iface && cmd_unset "$SEL_IFACE" ;;
+            9) prompt "Enter MAC:"; cmd_vendor "$REPLY" ;;
+            h|H) cmd_history ;;
+            \?|help) cmd_help ;;
+            q|Q|exit|quit) printf '  %sbye.%s\n\n' "$C_GRY" "$C_RESET"; exit 0 ;;
+            *) err "Unknown option: $choice" ;;
+        esac
+
+        printf '\n'
+        prompt "Press Enter to continue ..."
+    done
+}
+
+# -------- dispatch --------
+main() {
+    if [ $# -eq 0 ]; then
+        menu
+        return
+    fi
+    cmd="$1"; shift
+    case "$cmd" in
+        status|st|list|ls) cmd_status ;;
+        show|info)         cmd_show    "$@" ;;
+        set)               cmd_set     "$@" ;;
+        random|rand)       cmd_random  "$@" ;;
+        apply|reapply)     cmd_apply         ;;
+        restore|orig)      cmd_restore "$@" ;;
+        unset|forget|rm)   cmd_unset   "$@" ;;
+        vendor|oui|lookup) cmd_vendor  "$@" ;;
+        history|log)       cmd_history       ;;
+        version|-v|--version) cmd_version    ;;
+        help|-h|--help|"")    cmd_help       ;;
+        *) err "Unknown command: $cmd"; printf '\n'; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
